@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  Subnet:
+    Type: AWS::EC2::Subnet::Id
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+Resources:
+  DeadLetters:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+  Ingest:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 120
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetters.Arn
+        maxReceiveCount: 5
+  Archive:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  Findings:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+  Processor:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.12
+      Handler: audit.handler
+      CodeUri: src/
+      Timeout: 20
+      Environment:
+        Variables:
+          BUCKET: !Ref Archive
+          TABLE: !Ref Findings
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${Archive.Arn}/audit/*'
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt Findings.Arn
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt Ingest.Arn
+            FunctionResponseTypes: [ReportBatchItemFailures]
+  ProducerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SendAuditEvents
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Ingest.Arn
+  ProducerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ProducerRole]
+  Producer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref Ami
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref ProducerProfile
+      MetadataOptions:
+        HttpTokens: required
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: false
+          SubnetId: !Ref Subnet
+          GroupSet: [!Ref SecurityGroup]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          for outcome in success failure; do
+            aws sqs send-message --region '${AWS::Region}' --queue-url '${Ingest}' --message-body "{\"outcome\":\"$outcome\"}"
+          done
+Outputs:
+  ArchiveBucket:
+    Value: !Ref Archive
+  FindingsTable:
+    Value: !Ref Findings
